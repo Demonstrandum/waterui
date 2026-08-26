@@ -346,25 +346,130 @@ pub trait PlatformWindow: 'static {
     fn set_cursor_style(&mut self, style: CursorStyle);
 }
 
-/// Headless offscreen rendering surface.
+/// The adapter, device and queue an [`OffscreenSurface`] renders on.
 ///
-/// This owns its device to the end of its life, so it drains it on the way out
-/// — see `drain_device_before_teardown`. Every headless test builds one of
-/// these, and on a runner without a GPU they were the ones dying on drop.
-pub struct OffscreenSurface {
+/// A wgpu device is a heavyweight, driver-allocated resource, and on a machine
+/// whose only adapter is a software rasterizer it is heavyweight in *system*
+/// memory too. A process that builds one offscreen surface — a snapshot, a
+/// preview, a `waterui-testing` host — pays for exactly one and never notices.
+/// A process that builds hundreds, because it measures a fresh runtime per
+/// sample, pays hundreds of times and exhausts the machine.
+///
+/// Such a caller creates one context and hands a clone to every surface. The
+/// device is shared; everything a measurement is actually about — the view
+/// tree, the renderer, the retained scene — is still built fresh per surface.
+///
+/// This owns the device to the end of the last clone's life, so it drains it on
+/// the way out — see `drain_device_before_teardown`. Every headless test builds
+/// one of these, and on a runner without a GPU they were the ones dying on drop.
+#[derive(Clone, Debug)]
+pub struct OffscreenGpuContext {
+    /// Shared so the device is drained once, when the last surface using it
+    /// goes away. `drain_device_before_teardown` blocks until the device is
+    /// idle with no timeout, so running it per clone would make every surface's
+    /// drop wait out the work of every *other* surface still on that device.
+    inner: std::sync::Arc<OffscreenGpuContextInner>,
+}
+
+#[derive(Debug)]
+struct OffscreenGpuContextInner {
     adapter: wgpu::Adapter,
     device: wgpu::Device,
     queue: wgpu::Queue,
+}
+
+impl Drop for OffscreenGpuContextInner {
+    fn drop(&mut self) {
+        waterui_graphics::shared_context::drain_device_before_teardown(&self.device);
+    }
+}
+
+impl OffscreenGpuContext {
+    /// Lets the device release everything dropped since the last call.
+    ///
+    /// Non-blocking: it processes the destruction queue rather than waiting for
+    /// the device to go idle. Call it once the renderer and surface that used
+    /// this device are both gone — a process that builds and drops many of them
+    /// in sequence otherwise keeps every one of their allocations outstanding
+    /// until the device itself is torn down.
+    pub fn reclaim(&self) {
+        if let Err(error) = self.inner.device.poll(wgpu::PollType::Poll) {
+            tracing::warn!("GPU device did not reclaim dropped resources: {error}");
+        }
+    }
+
+    /// Requests a context on the adapter WaterUI would render an application on.
+    pub async fn new() -> Self {
+        Self::new_with_adapter_selection(AdapterSelection::PRODUCTION).await
+    }
+
+    /// Requests a context for WaterUI test hosts.
+    ///
+    /// Unlike a production context, this allows compute-capable software
+    /// adapters so CI can run Hydrolysis accessibility tests on llvmpipe
+    /// without opting the runtime path into fallback adapters.
+    #[cfg(any(test, feature = "testing"))]
+    pub async fn new_for_tests() -> Self {
+        Self::new_with_adapter_selection(AdapterSelection::TEST).await
+    }
+
+    /// Blocking [`Self::new_for_tests`], for synchronous test harnesses.
+    #[cfg(any(test, feature = "testing"))]
+    #[must_use]
+    pub fn new_for_tests_blocking() -> Self {
+        pollster::block_on(Self::new_for_tests())
+    }
+
+    async fn new_with_adapter_selection(selection: AdapterSelection) -> Self {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let adapter =
+            request_hydrolysis_adapter(&instance, None, "hydrolysis offscreen surface", selection)
+                .await;
+
+        ensure_compute_capable_adapter(
+            &adapter,
+            "hydrolysis offscreen surface",
+            "failed to find compute-capable wgpu adapter",
+        );
+        let required_limits = required_device_limits(&adapter);
+        let required_features =
+            waterui_graphics::shared_context::required_media_features(adapter.features());
+        let (device, queue) = adapter
+            .request_device(&wgpu::DeviceDescriptor {
+                label: Some("hydrolysis-offscreen-device"),
+                required_features,
+                required_limits,
+                memory_hints: wgpu::MemoryHints::Performance,
+                experimental_features: wgpu::ExperimentalFeatures::default(),
+                trace: wgpu::Trace::default(),
+            })
+            .await
+            .expect("hydrolysis offscreen surface: failed to request wgpu device");
+
+        Self {
+            inner: std::sync::Arc::new(OffscreenGpuContextInner {
+                adapter,
+                device,
+                queue,
+            }),
+        }
+    }
+}
+
+/// Headless offscreen rendering surface.
+///
+/// Dropping one lets the device reclaim the textures it allocated. That is a
+/// non-blocking maintain, not the full drain the device gets at teardown: a
+/// process that builds surfaces in sequence must not leave every surface's
+/// allocations outstanding until the last one goes away — on a software
+/// rasterizer that runs the machine out of memory — but neither should each
+/// drop wait out the queued work of the other surfaces sharing the device.
+pub struct OffscreenSurface {
+    gpu: OffscreenGpuContext,
     width: u32,
     height: u32,
     format: wgpu::TextureFormat,
     last_presented: Option<wgpu::Texture>,
-}
-
-impl Drop for OffscreenSurface {
-    fn drop(&mut self) {
-        waterui_graphics::shared_context::drain_device_before_teardown(&self.device);
-    }
 }
 
 fn should_force_fallback_adapter() -> bool {
@@ -599,6 +704,13 @@ fn log_selected_adapter(context: &str, adapter: &wgpu::Adapter) {
     );
 }
 
+impl Drop for OffscreenSurface {
+    fn drop(&mut self) {
+        self.last_presented = None;
+        self.gpu.reclaim();
+    }
+}
+
 impl core::fmt::Debug for OffscreenSurface {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("OffscreenSurface")
@@ -611,7 +723,7 @@ impl core::fmt::Debug for OffscreenSurface {
 
 impl OffscreenSurface {
     pub async fn new(width: u32, height: u32, format: wgpu::TextureFormat) -> Self {
-        Self::new_with_adapter_selection(width, height, format, AdapterSelection::PRODUCTION).await
+        Self::on_context(OffscreenGpuContext::new().await, width, height, format)
     }
 
     /// Creates an offscreen surface for WaterUI test hosts.
@@ -621,44 +733,27 @@ impl OffscreenSurface {
     /// llvmpipe without opting the runtime path into fallback adapters.
     #[cfg(any(test, feature = "testing"))]
     pub async fn new_for_tests(width: u32, height: u32, format: wgpu::TextureFormat) -> Self {
-        Self::new_with_adapter_selection(width, height, format, AdapterSelection::TEST).await
+        Self::on_context(
+            OffscreenGpuContext::new_for_tests().await,
+            width,
+            height,
+            format,
+        )
     }
 
-    async fn new_with_adapter_selection(
+    /// Creates a surface on an already-requested [`OffscreenGpuContext`].
+    ///
+    /// Every surface built on one context shares its device, so a process that
+    /// needs many surfaces requests a device once instead of once per surface.
+    #[must_use]
+    pub fn on_context(
+        gpu: OffscreenGpuContext,
         width: u32,
         height: u32,
         format: wgpu::TextureFormat,
-        selection: AdapterSelection,
     ) -> Self {
-        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
-        let adapter =
-            request_hydrolysis_adapter(&instance, None, "hydrolysis offscreen surface", selection)
-                .await;
-
-        ensure_compute_capable_adapter(
-            &adapter,
-            "hydrolysis offscreen surface",
-            "failed to find compute-capable wgpu adapter",
-        );
-        let required_limits = required_device_limits(&adapter);
-        let required_features =
-            waterui_graphics::shared_context::required_media_features(adapter.features());
-        let (device, queue) = adapter
-            .request_device(&wgpu::DeviceDescriptor {
-                label: Some("hydrolysis-offscreen-device"),
-                required_features,
-                required_limits,
-                memory_hints: wgpu::MemoryHints::Performance,
-                experimental_features: wgpu::ExperimentalFeatures::default(),
-                trace: wgpu::Trace::default(),
-            })
-            .await
-            .expect("hydrolysis offscreen surface: failed to request wgpu device");
-
         Self {
-            adapter,
-            device,
-            queue,
+            gpu,
             width: width.max(1),
             height: height.max(1),
             format,
@@ -721,36 +816,39 @@ or run on a host with a compute-capable GPU.{fallback_hint}",
 
 impl SurfaceProvider for OffscreenSurface {
     fn adapter(&self) -> &wgpu::Adapter {
-        &self.adapter
+        &self.gpu.inner.adapter
     }
 
     fn device(&self) -> &wgpu::Device {
-        &self.device
+        &self.gpu.inner.device
     }
 
     fn queue(&self) -> &wgpu::Queue {
-        &self.queue
+        &self.gpu.inner.queue
     }
 
     fn acquire(&mut self) -> Result<SurfaceFrame, SurfaceError> {
         let texture = self.last_presented.take().unwrap_or_else(|| {
-            self.device.create_texture(&wgpu::TextureDescriptor {
-                label: Some("hydrolysis-offscreen-frame"),
-                size: wgpu::Extent3d {
-                    width: self.width,
-                    height: self.height,
-                    depth_or_array_layers: 1,
-                },
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                format: self.format,
-                usage: wgpu::TextureUsages::TEXTURE_BINDING
-                    | wgpu::TextureUsages::COPY_SRC
-                    | wgpu::TextureUsages::STORAGE_BINDING
-                    | wgpu::TextureUsages::RENDER_ATTACHMENT,
-                view_formats: &[],
-            })
+            self.gpu
+                .inner
+                .device
+                .create_texture(&wgpu::TextureDescriptor {
+                    label: Some("hydrolysis-offscreen-frame"),
+                    size: wgpu::Extent3d {
+                        width: self.width,
+                        height: self.height,
+                        depth_or_array_layers: 1,
+                    },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: self.format,
+                    usage: wgpu::TextureUsages::TEXTURE_BINDING
+                        | wgpu::TextureUsages::COPY_SRC
+                        | wgpu::TextureUsages::STORAGE_BINDING
+                        | wgpu::TextureUsages::RENDER_ATTACHMENT,
+                    view_formats: &[],
+                })
         });
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
         Ok(SurfaceFrame::Offscreen { texture, view })
@@ -819,11 +917,30 @@ impl OffscreenWindow {
     ///
     /// This keeps production adapter selection strict while allowing
     /// `waterui-testing` to run on compute-capable software adapters in CI.
+    /// Requests a device of its own; a caller that builds several windows
+    /// should request one [`OffscreenGpuContext`] and use [`Self::on_context`].
     #[cfg(any(test, feature = "testing"))]
     #[must_use]
     pub fn new_for_tests(width: u32, height: u32, format: wgpu::TextureFormat) -> Self {
+        Self::on_context(
+            OffscreenGpuContext::new_for_tests_blocking(),
+            width,
+            height,
+            format,
+        )
+    }
+
+    /// Creates a window on an already-requested [`OffscreenGpuContext`], so
+    /// every window built on that context shares its device.
+    #[must_use]
+    pub fn on_context(
+        gpu: OffscreenGpuContext,
+        width: u32,
+        height: u32,
+        format: wgpu::TextureFormat,
+    ) -> Self {
         Self {
-            surface: pollster::block_on(OffscreenSurface::new_for_tests(width, height, format)),
+            surface: OffscreenSurface::on_context(gpu, width, height, format),
             scale_factor: 1.0,
             size_limits: None,
         }
