@@ -1554,6 +1554,55 @@ mod tests {
     }
 
     #[test]
+    fn ffi_scaffold_inherits_runtime_patches_not_app_workspace() {
+        let tempdir = tempdir().expect("temporary ffi scaffold dir");
+        let workspace = tempdir.path().join("workspace");
+        let project_root = workspace.join("app");
+        let waterui_root = workspace.join("vendor/waterui");
+        let ffi_dir = tempdir.path().join("cache/managed_backends/ffi");
+        std::fs::create_dir_all(&project_root).expect("app directory should exist");
+        std::fs::create_dir_all(&waterui_root).expect("runtime directory should exist");
+        std::fs::write(
+            workspace.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"app\"]\n",
+        )
+        .expect("app workspace manifest should be written");
+        std::fs::write(
+            project_root.join("Cargo.toml"),
+            "[package]\nname = \"test-app\"\nversion = \"0.1.0\"\n",
+        )
+        .expect("app manifest should be written");
+        std::fs::write(
+            waterui_root.join("Cargo.toml"),
+            "[workspace]\n\n[patch.crates-io]\nvello_hybrid = { git = \
+             \"https://example.com/vello\", rev = \"0123456789abcdef\" }\n",
+        )
+        .expect("runtime workspace manifest should be written");
+        let ctx = ctx(
+            Some(PathBuf::from("../vendor/waterui")),
+            Some(ffi_dir.clone()),
+            Some(project_root),
+            crate::project::PackageType::Playground,
+        );
+
+        smol::block_on(crate::templates::ffi::scaffold(
+            &ffi_dir,
+            &ctx,
+            "playground-ffi",
+        ))
+        .expect("ffi scaffold should succeed");
+
+        let cargo_toml = std::fs::read_to_string(ffi_dir.join("Cargo.toml"))
+            .expect("ffi Cargo.toml should be written");
+        let manifest = cargo_toml
+            .parse::<toml::Table>()
+            .expect("ffi Cargo.toml should parse");
+        let patch = &manifest["patch"]["crates-io"]["vello_hybrid"];
+        assert_eq!(patch["git"].as_str(), Some("https://example.com/vello"));
+        assert_eq!(patch["rev"].as_str(), Some("0123456789abcdef"));
+    }
+
+    #[test]
     fn ffi_scaffold_declares_minimal_cef_helper_for_chromium() {
         let tempdir = tempdir().expect("temporary ffi scaffold dir");
         let ffi_dir = tempdir.path().join("managed_backends/ffi");
@@ -2948,23 +2997,18 @@ pub mod esp32 {
     }
 }
 
-/// Copies the `[patch]` tables governing the app's own build into a generated
-/// companion manifest.
+/// Resolves the `[patch]` tables governing the selected WaterUI runtime.
 ///
-/// The companion crate is its own workspace root inside the build cache, and
-/// Cargo only honours `[patch]` from the root of the workspace being built.
-/// Without this, an app whose workspace patches a crate — say, a fork carrying
-/// an urgent upstream fix — silently builds the unpatched version whenever the
-/// build goes through a companion crate. Path patches are rebased onto
-/// absolute paths because the companion lives outside the app tree.
-async fn propagate_workspace_patches(
-    manifest: &mut cargo_toml::Manifest<()>,
-    project_root: &Path,
-) -> io::Result<()> {
-    let project_root = project_root.to_path_buf();
-    let patches = smol::unblock(move || collect_workspace_patches(&project_root)).await?;
-    manifest.patch = patches;
-    Ok(())
+/// Generated native companions are workspace roots of their own. Their
+/// framework dependencies come from `waterui_path`, so copying patches from the
+/// application workspace can silently mix a patched runtime with crates.io
+/// dependencies. Path patches are rebased onto absolute paths because the
+/// companion lives outside the runtime tree.
+async fn runtime_workspace_patches(ctx: &TemplateContext) -> io::Result<cargo_toml::PatchSet> {
+    let Some(root) = ctx.waterui_workspace_root() else {
+        return Ok(cargo_toml::PatchSet::default());
+    };
+    smol::unblock(move || collect_workspace_patches(&root)).await
 }
 
 /// Reads the `[patch]` tables from the workspace root that governs a build
@@ -3141,9 +3185,7 @@ pub mod ffi {
             ..Workspace::default()
         });
 
-        if let Some(project_root) = &ctx.project_root_path {
-            super::propagate_workspace_patches(&mut manifest, project_root).await?;
-        }
+        manifest.patch = super::runtime_workspace_patches(ctx).await?;
 
         let toml_string = toml::to_string_pretty(&manifest)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
@@ -3274,7 +3316,7 @@ pub mod root {
             build_dependencies: BTreeMap::new(),
             target: native_target_section(waterui_dependency),
             workspace: GeneratedWorkspaceSection {},
-            patch: cargo_toml::PatchSet::default(),
+            patch: super::runtime_workspace_patches(ctx).await?,
         };
 
         write_generated_cargo_toml(base_dir, super::render_generated_cargo_toml(&manifest)?).await
