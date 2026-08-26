@@ -1,0 +1,41 @@
+name: Sync upstream
+
+on:
+  schedule:
+    - cron: "41 4 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-upstream-dev
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out fork
+        uses: actions/checkout@v4
+        with:
+          ref: dev
+          fetch-depth: 0
+
+      - name: Merge water-rs/dev without discarding fork commits
+        run: |
+          git remote add upstream https://github.com/water-rs/waterui.git
+          git fetch upstream dev
+          if git merge-base --is-ancestor upstream/dev HEAD; then
+            echo "Fork already contains upstream/dev."
+            exit 0
+          fi
+          if git merge-base --is-ancestor HEAD upstream/dev; then
+            git merge --ff-only upstream/dev
+          else
+            git \
+              -c user.name=github-actions[bot] \
+              -c user.email=41898282+github-actions[bot]@users.noreply.github.com \
+              merge --no-edit upstream/dev
+          fi
+          git push origin HEAD:dev
