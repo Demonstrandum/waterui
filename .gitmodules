@@ -4,7 +4,7 @@
 	branch = dev
 [submodule "backends/apple"]
 	path = backends/apple
-	url = https://github.com/water-rs/apple-backend.git
+	url = https://github.com/Demonstrandum/apple-backend.git
 	branch = dev
 [submodule "kit"]
 	path = kit
