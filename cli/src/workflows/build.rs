@@ -121,9 +121,7 @@ impl RustDynamicLibraries {
     /// # Errors
     /// Returns an error when either required dynamic library is absent or ambiguous.
     pub async fn resolve(lib_dir: &Path, triple: &Triple) -> eyre::Result<Self> {
-        let waterui = lib_dir
-            .join("deps")
-            .join(dynamic_library_file_name("waterui_dylib", triple));
+        let waterui = lib_dir.join(dynamic_library_file_name("waterui_dylib", triple));
         if !waterui.is_file() {
             bail!(
                 "Shared WaterUI runtime was not built at {}",
@@ -173,7 +171,13 @@ impl RustDynamicLibraries {
     /// Returns an error when the destination cannot be created or a library cannot be copied.
     pub async fn stage(&self, destination: &Path) -> eyre::Result<()> {
         smol::fs::create_dir_all(destination).await?;
-        Self::remove_staged(destination, &self.triple).await?;
+        let waterui_destination = destination.join(
+            self.waterui
+                .file_name()
+                .ok_or_else(|| eyre::eyre!("Shared WaterUI runtime has no file name"))?,
+        );
+        let preserve_waterui = waterui_destination == self.waterui;
+        Self::remove_staged_inner(destination, &self.triple, preserve_waterui).await?;
         for source in self.iter() {
             let file_name = source.file_name().ok_or_else(|| {
                 eyre::eyre!(
@@ -181,7 +185,10 @@ impl RustDynamicLibraries {
                     source.display()
                 )
             })?;
-            crate::utils::copy_file(source, destination.join(file_name)).await?;
+            let staged = destination.join(file_name);
+            if staged != source {
+                crate::utils::copy_file(source, staged).await?;
+            }
         }
         Ok(())
     }
@@ -191,6 +198,14 @@ impl RustDynamicLibraries {
     /// # Errors
     /// Returns an error when the destination cannot be read or a matching library cannot be removed.
     pub async fn remove_staged(destination: &Path, triple: &Triple) -> eyre::Result<()> {
+        Self::remove_staged_inner(destination, triple, false).await
+    }
+
+    async fn remove_staged_inner(
+        destination: &Path,
+        triple: &Triple,
+        preserve_waterui: bool,
+    ) -> eyre::Result<()> {
         if !destination.is_dir() {
             return Ok(());
         }
@@ -207,7 +222,7 @@ impl RustDynamicLibraries {
             let entry = entry?;
             let file_name = entry.file_name();
             let file_name = file_name.to_string_lossy();
-            if file_name == waterui
+            if (file_name == waterui && !preserve_waterui)
                 || (file_name.starts_with(standard_library_prefix)
                     && entry.path().extension().and_then(|value| value.to_str()) == Some(extension))
             {

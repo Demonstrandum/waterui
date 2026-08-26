@@ -2211,6 +2211,9 @@ fn render_native_backend_bin_cargo_toml(
     }
 
     manifest.workspace = Some(Workspace::default());
+    if let Some(root) = ctx.waterui_workspace_root() {
+        manifest.patch = collect_workspace_patches(&root)?;
+    }
 
     toml::to_string_pretty(&manifest)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
@@ -2501,7 +2504,7 @@ pub mod android {
 pub mod gtk4 {
     use super::{
         GTK_BACKEND_VERSION, NativeBackendDependencyPathKind, NativeBackendDependencySpec, Path,
-        TemplateContext, TemplateNamespace, embedded, io, scaffold_dir,
+        TemplateContext, TemplateNamespace, WATERUI_VERSION, embedded, io, scaffold_dir,
         write_native_backend_bin_cargo_toml,
     };
 
@@ -2539,12 +2542,20 @@ pub mod gtk4 {
         if ctx.browser.chromium_enabled {
             features.push("chromium");
         }
-        let dependencies = [NativeBackendDependencySpec::new(
-            "waterui-gtk",
-            GTK_BACKEND_VERSION,
-            &features,
-            Some(NativeBackendDependencyPathKind::BackendsSubdir("gtk")),
-        )];
+        let dependencies = [
+            NativeBackendDependencySpec::new(
+                "waterui",
+                WATERUI_VERSION,
+                &[],
+                Some(NativeBackendDependencyPathKind::WateruiRoot),
+            ),
+            NativeBackendDependencySpec::new(
+                "waterui-gtk",
+                GTK_BACKEND_VERSION,
+                &features,
+                Some(NativeBackendDependencyPathKind::BackendsSubdir("gtk")),
+            ),
+        ];
         outputs.push((
             std::path::PathBuf::from("Cargo.toml"),
             super::render_native_backend_bin_cargo_toml(ctx, package_name, &dependencies)?
@@ -2566,12 +2577,20 @@ pub mod gtk4 {
         if ctx.browser.chromium_enabled {
             features.push("chromium");
         }
-        let dependencies = [NativeBackendDependencySpec::new(
-            "waterui-gtk",
-            GTK_BACKEND_VERSION,
-            &features,
-            Some(NativeBackendDependencyPathKind::BackendsSubdir("gtk")),
-        )];
+        let dependencies = [
+            NativeBackendDependencySpec::new(
+                "waterui",
+                WATERUI_VERSION,
+                &[],
+                Some(NativeBackendDependencyPathKind::WateruiRoot),
+            ),
+            NativeBackendDependencySpec::new(
+                "waterui-gtk",
+                GTK_BACKEND_VERSION,
+                &features,
+                Some(NativeBackendDependencyPathKind::BackendsSubdir("gtk")),
+            ),
+        ];
         write_native_backend_bin_cargo_toml(base_dir, ctx, package_name, &dependencies).await
     }
 }

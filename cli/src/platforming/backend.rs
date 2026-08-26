@@ -267,13 +267,91 @@ pub async fn reinit_backend<B: Backend>(project: &Project) -> Result<B, FailToIn
         }
     }
 
-    // Re-scaffold templates (cache dirs untouched)
-    B::init(project).await
+    // Re-scaffold templates (cache dirs untouched).
+    let backend = B::init(project).await?;
+    inherit_project_toolchain_for_backend::<B>(project)?;
+    Ok(backend)
+}
+
+/// Copies the project's nearest rustup toolchain file into a managed backend
+/// unless that backend declares its own specialized toolchain.
+///
+/// # Errors
+///
+/// Returns an I/O error when the inherited toolchain file cannot be copied.
+pub fn inherit_project_toolchain_for_backend<B: Backend>(project: &Project) -> std::io::Result<()> {
+    inherit_project_toolchain(project.root(), &project.backend_path::<B>())
+}
+
+fn inherit_project_toolchain(project_root: &Path, backend_path: &Path) -> std::io::Result<()> {
+    if !backend_path.is_dir() {
+        return Ok(());
+    }
+    if ["rust-toolchain.toml", "rust-toolchain"]
+        .iter()
+        .any(|name| backend_path.join(name).is_file())
+    {
+        return Ok(());
+    }
+    for directory in project_root.ancestors() {
+        for name in ["rust-toolchain.toml", "rust-toolchain"] {
+            let source = directory.join(name);
+            if source.is_file() {
+                std::fs::copy(source, backend_path.join(name))?;
+                return Ok(());
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn managed_backend_inherits_nearest_project_toolchain() -> std::io::Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let workspace = temporary.path().join("workspace");
+        let project = workspace.join("apps/gard");
+        let backend = temporary.path().join("managed/gtk4");
+        std::fs::create_dir_all(&project)?;
+        std::fs::create_dir_all(&backend)?;
+        std::fs::write(
+            workspace.join("rust-toolchain.toml"),
+            "[toolchain]\nchannel = \"nightly-2026-08-24\"\n",
+        )?;
+
+        inherit_project_toolchain(&project, &backend)?;
+
+        assert_eq!(
+            std::fs::read_to_string(backend.join("rust-toolchain.toml"))?,
+            "[toolchain]\nchannel = \"nightly-2026-08-24\"\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn backend_specific_toolchain_is_not_overwritten() -> std::io::Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let project = temporary.path().join("project");
+        let backend = temporary.path().join("managed/esp32");
+        std::fs::create_dir_all(&project)?;
+        std::fs::create_dir_all(&backend)?;
+        std::fs::write(
+            project.join("rust-toolchain.toml"),
+            "[toolchain]\nchannel = \"nightly\"\n",
+        )?;
+        std::fs::write(backend.join("rust-toolchain.toml"), "channel = \"esp\"\n")?;
+
+        inherit_project_toolchain(&project, &backend)?;
+
+        assert_eq!(
+            std::fs::read_to_string(backend.join("rust-toolchain.toml"))?,
+            "channel = \"esp\"\n"
+        );
+        Ok(())
+    }
 
     /// `[backends.esp32]` is device configuration, not backend-project
     /// scaffolding, so it alone must not trip the playground restriction.

@@ -560,6 +560,7 @@ async fn ensure_generated_run_backend_impl<T>(
 where
     T: waterui_cli::backend::Backend,
 {
+    waterui_cli::backend::inherit_project_toolchain_for_backend::<T>(&project)?;
     if !needs_reinit {
         return Ok(project);
     }
