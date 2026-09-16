@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1789556424076,
+  "lastUpdate": 1789556426593,
   "repoUrl": "https://github.com/Demonstrandum/waterui",
   "entries": {
     "WaterUI Bench (ubuntu-latest)": [
@@ -2763,6 +2763,48 @@ window.BENCHMARK_DATA = {
           {
             "name": "list-example/list_wheel_scroll/wheel-scroll frame mean",
             "value": 20733,
+            "unit": "us"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "name": "Demonstrandum",
+            "username": "Demonstrandum",
+            "email": "samuel@knutsen.co"
+          },
+          "committer": {
+            "name": "Demonstrandum",
+            "username": "Demonstrandum",
+            "email": "samuel@knutsen.co"
+          },
+          "id": "1a31a94d17483fa166d550644ab3593917fef5f8",
+          "message": "fix(apple): source the Swift 6.2-compatible backend\n\nPin the maintained Apple backend fork so Xcode 26.1 can resolve the package while upstream synchronization remains automatic.",
+          "timestamp": "2026-08-26T15:37:40Z",
+          "url": "https://github.com/Demonstrandum/waterui/commit/1a31a94d17483fa166d550644ab3593917fef5f8"
+        },
+        "date": 1789556426047,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "stress-example/stress_steady_redraw/steady-redraw frame p95",
+            "value": 817499,
+            "unit": "us"
+          },
+          {
+            "name": "stress-example/stress_steady_redraw/steady-redraw frame mean",
+            "value": 616097,
+            "unit": "us"
+          },
+          {
+            "name": "list-example/list_wheel_scroll/wheel-scroll frame p95",
+            "value": 27100,
+            "unit": "us"
+          },
+          {
+            "name": "list-example/list_wheel_scroll/wheel-scroll frame mean",
+            "value": 17681,
             "unit": "us"
           }
         ]
